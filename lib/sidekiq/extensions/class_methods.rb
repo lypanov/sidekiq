@@ -1,5 +1,7 @@
 require 'sidekiq/extensions/generic_proxy'
 
+=begin
+
 module Sidekiq
   module Extensions
     ##
@@ -31,3 +33,5 @@ module Sidekiq
 end
 
 Class.send(:include, Sidekiq::Extensions::Klass)
+
+=end

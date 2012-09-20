@@ -1,3 +1,5 @@
+=begin
+
 module Sidekiq
   def self.hook_rails!
     return unless Sidekiq.options[:enable_rails_extensions]
@@ -18,3 +20,5 @@ module Sidekiq
     end
   end if defined?(::Rails)
 end
+
+=end
