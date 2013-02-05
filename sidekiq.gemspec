@@ -14,16 +14,17 @@ Gem::Specification.new do |gem|
   gem.name          = "sidekiq"
   gem.require_paths = ["lib"]
   gem.version       = Sidekiq::VERSION
+  gem.signing_key   = File.expand_path('~/.ssh/gem-private_key.pem')
+  gem.cert_chain    = ['.public_cert.pem']
   gem.add_dependency                  'redis', '~> 3'
   gem.add_dependency                  'redis-namespace'
-  gem.add_dependency                  'connection_pool', '~> 0.9.2'
+  gem.add_dependency                  'connection_pool', '~> 1.0'
   gem.add_dependency                  'celluloid', '~> 0.12.0'
   gem.add_dependency                  'multi_json', '~> 1'
-  gem.add_development_dependency      'minitest', '~> 3'
+  gem.add_development_dependency      'minitest', '~> 4'
   gem.add_development_dependency      'sinatra'
   gem.add_development_dependency      'slim'
   gem.add_development_dependency      'rake'
   gem.add_development_dependency      'actionmailer', '~> 3'
   gem.add_development_dependency      'activerecord', '~> 3'
-  gem.add_development_dependency      'pry'
 end
