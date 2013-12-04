@@ -1,4 +1,79 @@
 module Sidekiq
+
+  class Testing
+    class << self
+      attr_accessor :__test_mode
+
+      def __set_test_mode(mode, &block)
+        if block
+          current_mode = self.__test_mode
+          begin
+            self.__test_mode = mode
+            block.call
+          ensure
+            self.__test_mode = current_mode
+          end
+        else
+          self.__test_mode = mode
+        end
+      end
+
+      def disable!(&block)
+        __set_test_mode(:disable, &block)
+      end
+
+      def fake!(&block)
+        __set_test_mode(:fake, &block)
+      end
+
+      def inline!(&block)
+        __set_test_mode(:inline, &block)
+      end
+
+      def enabled?
+        self.__test_mode != :disable
+      end
+
+      def disabled?
+        self.__test_mode == :disable
+      end
+
+      def fake?
+        self.__test_mode == :fake
+      end
+
+      def inline?
+        self.__test_mode == :inline
+      end
+    end
+  end
+
+  # Default to fake testing to keep old behavior
+  Sidekiq::Testing.fake!
+
+  class EmptyQueueError < RuntimeError; end
+
+  class Client
+    alias_method :raw_push_real, :raw_push
+
+    def raw_push(payloads)
+      if Sidekiq::Testing.fake?
+        payloads.each do |job|
+          job['class'].constantize.jobs << Sidekiq.load_json(Sidekiq.dump_json(job))
+        end
+        true
+      elsif Sidekiq::Testing.inline?
+        payloads.each do |item|
+          marshalled = Sidekiq.load_json(Sidekiq.dump_json(item))
+          marshalled['class'].constantize.new.perform(*marshalled['args'])
+        end
+        true
+      else
+        raw_push_real(payloads)
+      end
+    end
+  end
+
   module Worker
     ##
     # The Sidekiq testing infrastructure overrides perform_async
@@ -56,12 +131,6 @@ module Sidekiq
     #   Then I should receive a welcome email to "foo@example.com"
     #
     module ClassMethods
-      alias_method :client_push_old, :client_push
-
-      def client_push(opts)
-        jobs << opts
-        true
-      end
 
       # Jobs queued for this worker
       def jobs
@@ -76,8 +145,19 @@ module Sidekiq
       # Drain and run all jobs for this worker
       def drain
         while job = jobs.shift do
-          new.perform(*job['args'])
+          worker = new
+          worker.jid = job['jid']
+          worker.perform(*job['args'])
         end
+      end
+
+      # Pop out a single job and perform it
+      def perform_one
+        raise(EmptyQueueError, "perform_one called with empty job queue") if jobs.empty?
+        job = jobs.shift
+        worker = new
+        worker.jid = job['jid']
+        worker.perform(*job['args'])
       end
     end
 

@@ -49,19 +49,31 @@ module Sidekiq
   #   end
   # end
   #
-  # This is an example of a minimal client middleware:
+  # This is an example of a minimal client middleware, note
+  # the method must return the result or the job will not push
+  # to Redis:
   #
   # class MyClientHook
   #   def call(worker_class, msg, queue)
   #     puts "Before push"
-  #     yield
+  #     result = yield
   #     puts "After push"
+  #     result
   #   end
   # end
   #
   module Middleware
     class Chain
+      include Enumerable
       attr_reader :entries
+
+      def initialize_copy(copy)
+        copy.instance_variable_set(:@entries, entries.dup)
+      end
+
+      def each(&block)
+        entries.each(&block)
+      end
 
       def initialize
         @entries = []
@@ -73,29 +85,30 @@ module Sidekiq
       end
 
       def add(klass, *args)
-        entries << Entry.new(klass, *args) unless exists?(klass)
+        remove(klass) if exists?(klass)
+        entries << Entry.new(klass, *args)
       end
 
       def insert_before(oldklass, newklass, *args)
         i = entries.index { |entry| entry.klass == newklass }
         new_entry = i.nil? ? Entry.new(newklass, *args) : entries.delete_at(i)
-        i = entries.find_index { |entry| entry.klass == oldklass } || 0
+        i = entries.index { |entry| entry.klass == oldklass } || 0
         entries.insert(i, new_entry)
       end
 
       def insert_after(oldklass, newklass, *args)
         i = entries.index { |entry| entry.klass == newklass }
         new_entry = i.nil? ? Entry.new(newklass, *args) : entries.delete_at(i)
-        i = entries.find_index { |entry| entry.klass == oldklass } || entries.count - 1
+        i = entries.index { |entry| entry.klass == oldklass } || entries.count - 1
         entries.insert(i+1, new_entry)
       end
 
       def exists?(klass)
-        entries.any? { |entry| entry.klass == klass }
+        any? { |entry| entry.klass == klass }
       end
 
       def retrieve
-        entries.map(&:make_new)
+        map(&:make_new)
       end
 
       def clear
@@ -117,6 +130,7 @@ module Sidekiq
 
     class Entry
       attr_reader :klass
+
       def initialize(klass, *args)
         @klass = klass
         @args  = args

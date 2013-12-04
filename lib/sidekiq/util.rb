@@ -15,6 +15,7 @@ module Sidekiq
       yield
     rescue Exception => ex
       handle_exception(ex, { :context => last_words })
+      raise ex
     end
 
     def logger
@@ -26,7 +27,7 @@ module Sidekiq
     end
 
     def process_id
-      Process.pid
+      @@process_id ||= SecureRandom.hex
     end
 
     def hostname

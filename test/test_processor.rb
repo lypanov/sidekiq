@@ -1,14 +1,14 @@
 require 'helper'
 require 'sidekiq/processor'
 
-class TestProcessor < MiniTest::Unit::TestCase
+class TestProcessor < Sidekiq::Test
   TestException = Class.new(StandardError)
   TEST_EXCEPTION = TestException.new("kerboom!")
 
   describe 'with mock setup' do
     before do
       $invokes = 0
-      @boss = MiniTest::Mock.new
+      @boss = Minitest::Mock.new
       @processor = ::Sidekiq::Processor.new(@boss)
       Celluloid.logger = nil
       Sidekiq.redis = REDIS
@@ -29,8 +29,10 @@ class TestProcessor < MiniTest::Unit::TestCase
 
     it 'processes as expected' do
       msg = Sidekiq.dump_json({ 'class' => MockWorker.to_s, 'args' => ['myarg'] })
-      actor = MiniTest::Mock.new
+      actor = Minitest::Mock.new
       actor.expect(:processor_done, nil, [@processor])
+      actor.expect(:real_thread, nil, [nil, Thread])
+      @boss.expect(:async, actor, [])
       @boss.expect(:async, actor, [])
       @processor.process(work(msg))
       @boss.verify
@@ -38,6 +40,9 @@ class TestProcessor < MiniTest::Unit::TestCase
     end
 
     it 'passes exceptions to ExceptionHandler' do
+      actor = Minitest::Mock.new
+      actor.expect(:real_thread, nil, [nil, Thread])
+      @boss.expect(:async, actor, [])
       msg = Sidekiq.dump_json({ 'class' => MockWorker.to_s, 'args' => ['boom'] })
       begin
         @processor.process(work(msg))
@@ -51,6 +56,9 @@ class TestProcessor < MiniTest::Unit::TestCase
     it 're-raises exceptions after handling' do
       msg = Sidekiq.dump_json({ 'class' => MockWorker.to_s, 'args' => ['boom'] })
       re_raise = false
+      actor = Minitest::Mock.new
+      actor.expect(:real_thread, nil, [nil, Thread])
+      @boss.expect(:async, actor, [])
 
       begin
         @processor.process(work(msg))
@@ -65,8 +73,10 @@ class TestProcessor < MiniTest::Unit::TestCase
       msg = { 'class' => MockWorker.to_s, 'args' => [['myarg']] }
       msgstr = Sidekiq.dump_json(msg)
       processor = ::Sidekiq::Processor.new(@boss)
-      actor = MiniTest::Mock.new
+      actor = Minitest::Mock.new
       actor.expect(:processor_done, nil, [processor])
+      actor.expect(:real_thread, nil, [nil, Thread])
+      @boss.expect(:async, actor, [])
       @boss.expect(:async, actor, [])
       processor.process(work(msgstr))
       assert_equal [['myarg']], msg['args']
@@ -77,11 +87,25 @@ class TestProcessor < MiniTest::Unit::TestCase
         Sidekiq.redis {|c| c.flushdb }
       end
 
+      def with_expire(time)
+        begin
+          old = Sidekiq::Processor::STATS_TIMEOUT
+          silence_warnings { Sidekiq::Processor.const_set(:STATS_TIMEOUT, time) }
+          yield
+        ensure
+          silence_warnings { Sidekiq::Processor.const_set(:STATS_TIMEOUT, old) }
+        end
+      end
+
       describe 'when successful' do
+        let(:processed_today_key) { "stat:processed:#{Time.now.utc.to_date}" }
+
         def successful_job
           msg = Sidekiq.dump_json({ 'class' => MockWorker.to_s, 'args' => ['myarg'] })
-          actor = MiniTest::Mock.new
+          actor = Minitest::Mock.new
+          actor.expect(:real_thread, nil, [nil, Thread])
           actor.expect(:processor_done, nil, [@processor])
+          @boss.expect(:async, actor, [])
           @boss.expect(:async, actor, [])
           @processor.process(work(msg))
         end
@@ -91,17 +115,24 @@ class TestProcessor < MiniTest::Unit::TestCase
           assert_equal 1, Sidekiq::Stats.new.processed
         end
 
+        it 'expires processed stat' do
+          successful_job
+          assert_equal Sidekiq::Processor::STATS_TIMEOUT, Sidekiq.redis { |conn| conn.ttl(processed_today_key) }
+        end
+
         it 'increments date processed stat' do
-          Time.stub(:now, Time.parse("2012-12-25 1:00:00 -0500")) do
-            successful_job
-            date_processed = Sidekiq.redis { |conn| conn.get("stat:processed:2012-12-25") }.to_i
-            assert_equal 1, date_processed
-          end
+          successful_job
+          assert_equal 1, Sidekiq.redis { |conn| conn.get(processed_today_key) }.to_i
         end
       end
 
       describe 'when failed' do
+        let(:failed_today_key) { "stat:failed:#{Time.now.utc.to_date}" }
+
         def failed_job
+          actor = Minitest::Mock.new
+          actor.expect(:real_thread, nil, [nil, Thread])
+          @boss.expect(:async, actor, [])
           msg = Sidekiq.dump_json({ 'class' => MockWorker.to_s, 'args' => ['boom'] })
           begin
             @processor.process(work(msg))
@@ -115,14 +146,15 @@ class TestProcessor < MiniTest::Unit::TestCase
         end
 
         it 'increments date failed stat' do
-          Time.stub(:now, Time.parse("2012-12-25 1:00:00 -0500")) do
-            failed_job
-            date_failed = Sidekiq.redis { |conn| conn.get("stat:failed:2012-12-25") }.to_i
-            assert_equal 1, date_failed
-          end
+          failed_job
+          assert_equal 1, Sidekiq.redis { |conn| conn.get(failed_today_key) }.to_i
+        end
+
+        it 'expires failed stat' do
+          failed_job
+          assert_equal Sidekiq::Processor::STATS_TIMEOUT, Sidekiq.redis { |conn| conn.ttl(failed_today_key) }
         end
       end
-
     end
   end
 end

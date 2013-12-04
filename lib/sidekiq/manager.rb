@@ -1,6 +1,5 @@
-require 'celluloid'
-
 require 'sidekiq/util'
+require 'sidekiq/actor'
 require 'sidekiq/processor'
 require 'sidekiq/fetch'
 
@@ -13,40 +12,58 @@ module Sidekiq
   #
   class Manager
     include Util
-    include Celluloid
-
+    include Actor
     trap_exit :processor_died
+
+    attr_reader :ready
+    attr_reader :busy
+    attr_accessor :fetcher
+
+    SPIN_TIME_FOR_GRACEFUL_SHUTDOWN = 1
 
     def initialize(options={})
       logger.debug { options.inspect }
+      @options = options
       @count = options[:concurrency] || 25
       @done_callback = nil
 
       @in_progress = {}
+      @threads = {}
       @done = false
       @busy = []
-      @fetcher = Fetcher.new(current_actor, options)
-      @ready = @count.times.map { Processor.new_link(current_actor) }
-      procline(options[:tag] ? "#{options[:tag]} " : '')
+      @ready = @count.times.map do
+        p = Processor.new_link(current_actor)
+        p.proxy_id = p.object_id
+        p
+      end
     end
 
     def stop(options={})
       watchdog('Manager#stop died') do
-        shutdown = options[:shutdown]
+        should_shutdown = options[:shutdown]
         timeout = options[:timeout]
 
         @done = true
-        Sidekiq::Fetcher.done!
-        @fetcher.async.terminate if @fetcher.alive?
 
         logger.info { "Shutting down #{@ready.size} quiet workers" }
         @ready.each { |x| x.terminate if x.alive? }
         @ready.clear
 
-        return after(0) { signal(:shutdown) } if @busy.empty?
-        logger.info { "Pausing up to #{timeout} seconds to allow workers to finish..." }
-        hard_shutdown_in timeout if shutdown
+        clear_worker_set
+        return if clean_up_for_graceful_shutdown
+
+        hard_shutdown_in timeout if should_shutdown
       end
+    end
+
+    def clean_up_for_graceful_shutdown
+      if @busy.empty?
+        shutdown
+        return true
+      end
+
+      after(SPIN_TIME_FOR_GRACEFUL_SHUTDOWN) { clean_up_for_graceful_shutdown }
+      false
     end
 
     def start
@@ -61,10 +78,11 @@ module Sidekiq
       watchdog('Manager#processor_done died') do
         @done_callback.call(processor) if @done_callback
         @in_progress.delete(processor.object_id)
+        @threads.delete(processor.object_id)
         @busy.delete(processor)
         if stopped?
           processor.terminate if processor.alive?
-          signal(:shutdown) if @busy.empty?
+          shutdown if @busy.empty?
         else
           @ready << processor if processor.alive?
         end
@@ -75,13 +93,16 @@ module Sidekiq
     def processor_died(processor, reason)
       watchdog("Manager#processor_died died") do
         @in_progress.delete(processor.object_id)
+        @threads.delete(processor.object_id)
         @busy.delete(processor)
 
         unless stopped?
-          @ready << Processor.new_link(current_actor)
+          p = Processor.new_link(current_actor)
+          p.proxy_id = p.object_id
+          @ready << p
           dispatch
         else
-          signal(:shutdown) if @busy.empty?
+          shutdown if @busy.empty?
         end
       end
     end
@@ -103,42 +124,56 @@ module Sidekiq
       end
     end
 
+    # A hack worthy of Rube Goldberg.  We need to be able
+    # to hard stop a working thread.  But there's no way for us to
+    # get handle to the underlying thread performing work for a processor
+    # so we have it call us and tell us.
+    def real_thread(proxy_id, thr)
+      @threads[proxy_id] = thr
+    end
+
+    def procline(tag)
+      "sidekiq #{Sidekiq::VERSION} #{tag}[#{@busy.size} of #{@count} busy]#{stopped? ? ' stopping' : ''}"
+    end
+
     private
 
+    def clear_worker_set
+      # Clearing workers in Redis
+      # NOTE: we do this before terminating worker threads because the
+      # process will likely receive a hard shutdown soon anyway, which
+      # means the threads will killed.
+      logger.debug { "Clearing workers in redis" }
+      Sidekiq.redis do |conn|
+        workers = conn.smembers('workers')
+        workers_to_remove = workers.select do |worker_name|
+          worker_name =~ /:#{process_id}-/
+        end
+        conn.srem('workers', workers_to_remove) if !workers_to_remove.empty?
+      end
+    rescue => ex
+      Sidekiq.logger.warn("Unable to clear worker set while shutting down: #{ex.message}")
+    end
+
     def hard_shutdown_in(delay)
+      logger.info { "Pausing up to #{delay} seconds to allow workers to finish..." }
+
       after(delay) do
-        watchdog("Manager#watch_for_shutdown died") do
+        watchdog("Manager#hard_shutdown_in died") do
           # We've reached the timeout and we still have busy workers.
           # They must die but their messages shall live on.
           logger.info("Still waiting for #{@busy.size} busy workers")
 
-          # Re-enqueue terminated jobs
-          # NOTE: You may notice that we may push a job back to redis before
-          # the worker thread is terminated. This is ok because Sidekiq's
-          # contract says that jobs are run AT LEAST once. Process termination
-          # is delayed until we're certain the jobs are back in Redis because
-          # it is worse to lose a job than to run it twice.
-          Sidekiq.options[:fetch].bulk_requeue(@in_progress.values)
+          requeue
 
-          # Clearing workers in Redis
-          # NOTE: we do this before terminating worker threads because the
-          # process will likely receive a hard shutdown soon anyway, which
-          # means the threads will killed.
-          logger.debug { "Clearing workers in redis" }
-          Sidekiq.redis do |conn|
-            workers = conn.smembers('workers')
-            workers_to_remove = workers.select do |worker_name|
-              worker_name =~ /:#{process_id}-/
-            end
-            conn.srem('workers', workers_to_remove)
-          end
-
-          logger.debug { "Terminating worker threads" }
+          logger.warn { "Terminating #{@busy.size} busy worker threads" }
           @busy.each do |processor|
-            processor.terminate if processor.alive?
+            if processor.alive? && t = @threads.delete(processor.object_id)
+              t.raise Shutdown
+            end
           end
 
-          after(0) { signal(:shutdown) }
+          signal_shutdown
         end
       end
     end
@@ -157,9 +192,24 @@ module Sidekiq
       @done
     end
 
-    def procline(tag)
-      $0 = "sidekiq #{Sidekiq::VERSION} #{tag}[#{@busy.size} of #{@count} busy]#{stopped? ? ' stopping' : ''}"
-      after(5) { procline(tag) }
+    def shutdown
+      requeue
+      signal_shutdown
+    end
+
+    def signal_shutdown
+      after(0) { signal(:shutdown) }
+    end
+
+    def requeue
+      # Re-enqueue terminated jobs
+      # NOTE: You may notice that we may push a job back to redis before
+      # the worker thread is terminated. This is ok because Sidekiq's
+      # contract says that jobs are run AT LEAST once. Process termination
+      # is delayed until we're certain the jobs are back in Redis because
+      # it is worse to lose a job than to run it twice.
+      Sidekiq::Fetcher.strategy.bulk_requeue(@in_progress.values, @options)
+      @in_progress.clear
     end
   end
 end

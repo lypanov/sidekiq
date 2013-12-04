@@ -17,7 +17,7 @@ class Component
   end
 end
 
-class TestExceptionHandler < MiniTest::Unit::TestCase
+class TestExceptionHandler < Sidekiq::Test
   describe "with mock logger" do
     before do
       @old_logger = Sidekiq.logger
@@ -37,11 +37,25 @@ class TestExceptionHandler < MiniTest::Unit::TestCase
       assert_match /Something didn't work!/, log[1], "didn't include the exception message"
       assert_match /test\/test_exception_handler.rb/, log[2], "didn't include the backtrace"
     end
+
+    describe "when the exception does not have a backtrace" do
+      it "does not fail" do
+        exception = ExceptionHandlerTestException.new
+        assert_nil exception.backtrace
+
+        begin
+          Component.new.handle_exception exception
+          pass
+        rescue => e
+          flunk "failed handling a nil backtrace"
+        end
+      end
+    end
   end
 
   describe "with fake Airbrake" do
     before do
-      ::Airbrake = MiniTest::Mock.new
+      ::Airbrake = Minitest::Mock.new
     end
 
     after do
@@ -57,7 +71,7 @@ class TestExceptionHandler < MiniTest::Unit::TestCase
 
   describe "with fake Honeybadger" do
     before do
-      ::Honeybadger = MiniTest::Mock.new
+      ::Honeybadger = Minitest::Mock.new
     end
 
     after do
@@ -73,8 +87,7 @@ class TestExceptionHandler < MiniTest::Unit::TestCase
 
   describe "with fake ExceptionNotifier" do
     before do
-      ::ExceptionNotifier = Module.new
-      ::ExceptionNotifier::Notifier = MiniTest::Mock.new
+      ::ExceptionNotifier = MiniTest::Mock.new
     end
 
     after do
@@ -82,12 +95,9 @@ class TestExceptionHandler < MiniTest::Unit::TestCase
     end
 
     it "notifies ExceptionNotifier" do
-      mail = MiniTest::Mock.new
-      mail.expect(:deliver,nil)
-      ::ExceptionNotifier::Notifier.expect(:background_exception_notification,mail,[TEST_EXCEPTION, :data => { :message => { :b => 2 } }])
+      ::ExceptionNotifier.expect(:notify_exception,true,[TEST_EXCEPTION, :data => { :message => { :b => 2 } }])
       Component.new.invoke_exception(:b => 2)
-      ::ExceptionNotifier::Notifier.verify
-      mail.verify
+      ::ExceptionNotifier.verify
     end
   end
 
@@ -104,9 +114,9 @@ class TestExceptionHandler < MiniTest::Unit::TestCase
         end
       end
 
-      ::Exceptional::Config = MiniTest::Mock.new
-      ::Exceptional::Remote = MiniTest::Mock.new
-      ::Exceptional::ExceptionData = MiniTest::Mock.new
+      ::Exceptional::Config = Minitest::Mock.new
+      ::Exceptional::Remote = Minitest::Mock.new
+      ::Exceptional::ExceptionData = Minitest::Mock.new
     end
 
     after do

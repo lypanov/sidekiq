@@ -11,7 +11,7 @@ def cli.valid?
   !@code
 end
 
-class TestCli < MiniTest::Unit::TestCase
+class TestCli < Sidekiq::Test
   describe 'with cli' do
 
     before do
@@ -42,6 +42,11 @@ class TestCli < MiniTest::Unit::TestCase
 
     it 'accepts a process index' do
       @cli.parse(['sidekiq', '-i', '7', '-r', './test/fake_env.rb'])
+      assert_equal 7, Sidekiq.options[:index]
+    end
+
+    it 'accepts a stringy process index' do
+      @cli.parse(['sidekiq', '-i', 'worker.7', '-r', './test/fake_env.rb'])
       assert_equal 7, Sidekiq.options[:index]
     end
 
@@ -169,8 +174,8 @@ class TestCli < MiniTest::Unit::TestCase
         assert_equal './test/fake_env.rb', Sidekiq.options[:require]
       end
 
-      it 'sets environment' do
-        assert_equal 'xzibit', Sidekiq.options[:environment]
+      it 'does not set environment' do
+        assert_equal nil, Sidekiq.options[:environment]
       end
 
       it 'sets concurrency' do

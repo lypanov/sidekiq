@@ -1,3 +1,4 @@
+# encoding: utf-8
 require 'sidekiq/version'
 require 'sidekiq/logging'
 require 'sidekiq/client'
@@ -6,12 +7,7 @@ require 'sidekiq/redis_connection'
 require 'sidekiq/util'
 require 'sidekiq/api'
 
-require 'sidekiq/extensions/class_methods'
-require 'sidekiq/extensions/action_mailer'
-require 'sidekiq/extensions/active_record'
-require 'sidekiq/rails' if defined?(::Rails::Engine)
-
-require 'multi_json'
+require 'json'
 
 module Sidekiq
   NAME = "Sidekiq"
@@ -26,6 +22,10 @@ module Sidekiq
     :profile => false,
   }
 
+  def self.❨╯°□°❩╯︵┻━┻
+    puts "Calm down, bro"
+  end
+
   def self.options
     @options ||= DEFAULTS.dup
   end
@@ -38,7 +38,7 @@ module Sidekiq
   # Configuration for Sidekiq server, use like:
   #
   #   Sidekiq.configure_server do |config|
-  #     config.redis = { :namespace => 'myapp', :size => 25, :url => 'redis://myhost:8877/mydb' }
+  #     config.redis = { :namespace => 'myapp', :size => 25, :url => 'redis://myhost:8877/0' }
   #     config.server_middleware do |chain|
   #       chain.add MyServerHook
   #     end
@@ -51,7 +51,7 @@ module Sidekiq
   # Configuration for Sidekiq client, use like:
   #
   #   Sidekiq.configure_client do |config|
-  #     config.redis = { :namespace => 'myapp', :size => 1, :url => 'redis://myhost:8877/mydb' }
+  #     config.redis = { :namespace => 'myapp', :size => 1, :url => 'redis://myhost:8877/0' }
   #   end
   def self.configure_client
     yield self unless server?
@@ -63,23 +63,22 @@ module Sidekiq
 
   def self.redis(&block)
     raise ArgumentError, "requires a block" if !block
-    @redis ||= Sidekiq::RedisConnection.create
+    @redis ||= Sidekiq::RedisConnection.create(@hash || {})
     @redis.with(&block)
   end
 
   def self.redis=(hash)
+    return @redis = hash if hash.is_a?(ConnectionPool)
+
     if hash.is_a?(Hash)
-      @redis = RedisConnection.create(hash)
-      options[:namespace] ||= hash[:namespace]
-    elsif hash.is_a?(ConnectionPool)
-      @redis = hash
+      @hash = hash
     else
       raise ArgumentError, "redis= requires a Hash or ConnectionPool"
     end
   end
 
   def self.client_middleware
-    @client_chain ||= Client.default_middleware
+    @client_chain ||= Middleware::Chain.new
     yield @client_chain if block_given?
     @client_chain
   end
@@ -90,12 +89,20 @@ module Sidekiq
     @server_chain
   end
 
+  def self.default_worker_options=(hash)
+    @default_worker_options = default_worker_options.merge(hash)
+  end
+
+  def self.default_worker_options
+    @default_worker_options || { 'retry' => true, 'queue' => 'default' }
+  end
+
   def self.load_json(string)
-    MultiJson.decode(string)
+    JSON.parse(string)
   end
 
   def self.dump_json(object)
-    MultiJson.encode(object)
+    JSON.generate(object)
   end
 
   def self.logger
@@ -110,16 +117,9 @@ module Sidekiq
     self.options[:poll_interval] = interval
   end
 
-  ##
-  # deprecated
-  def self.size(*queues)
-    return Sidekiq::Stats.new.enqueued if queues.empty?
-
-    Sidekiq.redis { |conn|
-      conn.multi {
-        queues.map { |q| conn.llen("queue:#{q}") }
-      }
-    }.inject(0) { |memo, count| memo += count }
-  end
-
 end
+
+require 'sidekiq/extensions/class_methods'
+require 'sidekiq/extensions/action_mailer'
+require 'sidekiq/extensions/active_record'
+require 'sidekiq/rails' if defined?(::Rails::Engine)

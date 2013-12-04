@@ -26,6 +26,8 @@ module Sidekiq
     def self.included(base)
       base.extend(ClassMethods)
       base.class_attribute :sidekiq_options_hash
+      base.class_attribute :sidekiq_retry_in_block
+      base.class_attribute :sidekiq_retries_exhausted_block
     end
 
     def logger
@@ -40,8 +42,15 @@ module Sidekiq
 
       def perform_in(interval, *args)
         int = interval.to_f
-        ts = (int < 1_000_000_000 ? Time.now.to_f + int : int)
-        client_push('class' => self, 'args' => args, 'at' => ts)
+        now = Time.now.to_f
+        ts = (int < 1_000_000_000 ? now + int : int)
+
+        item = { 'class' => self, 'args' => args, 'at' => ts }
+
+        # Optimization to enqueue something now that is scheduled to go out now or in the past
+        item.delete('at') if ts <= now
+
+        client_push(item)
       end
       alias_method :perform_at, :perform_in
 
@@ -51,17 +60,23 @@ module Sidekiq
       #
       #   :queue - use a named queue for this Worker, default 'default'
       #   :retry - enable the RetryJobs middleware for this Worker, default *true*
-      #   :timeout - timeout the perform method after N seconds, default *nil*
       #   :backtrace - whether to save any error backtrace in the retry payload to display in web UI,
       #      can be true, false or an integer number of lines to save, default *false*
       def sidekiq_options(opts={})
         self.sidekiq_options_hash = get_sidekiq_options.merge((opts || {}).stringify_keys)
+        ::Sidekiq.logger.warn("#{self.name} - :timeout is unsafe and support has been removed from Sidekiq, see http://bit.ly/OtYpK for details") if opts.include? :timeout
       end
 
-      DEFAULT_OPTIONS = { 'retry' => true, 'queue' => 'default' }
+      def sidekiq_retry_in(&block)
+        self.sidekiq_retry_in_block = block
+      end
+
+      def sidekiq_retries_exhausted(&block)
+        self.sidekiq_retries_exhausted_block = block
+      end
 
       def get_sidekiq_options # :nodoc:
-        self.sidekiq_options_hash ||= DEFAULT_OPTIONS
+        self.sidekiq_options_hash ||= Sidekiq.default_worker_options
       end
 
       def client_push(item) # :nodoc:

@@ -9,7 +9,7 @@ require 'sidekiq/extensions/active_record'
 
 Sidekiq.hook_rails!
 
-class TestInline < MiniTest::Unit::TestCase
+class TestInline < Sidekiq::Test
   describe 'sidekiq inline testing' do
     class InlineError < RuntimeError; end
     class ParameterIsNotString < RuntimeError; end
@@ -41,15 +41,12 @@ class TestInline < MiniTest::Unit::TestCase
     end
 
     before do
-      load 'sidekiq/testing/inline.rb'
+      require 'sidekiq/testing/inline.rb'
+      Sidekiq::Testing.inline!
     end
 
     after do
-      Sidekiq::Client.singleton_class.class_eval do
-        remove_method :raw_push
-        alias_method :raw_push, :raw_push_old
-        remove_method :raw_push_old
-      end
+      Sidekiq::Testing.disable!
     end
 
     it 'stubs the async call when in testing mode' do
@@ -81,10 +78,10 @@ class TestInline < MiniTest::Unit::TestCase
     end
 
     it 'stubs the push_bulk call when in testing mode' do
-      assert Sidekiq::Client.push_bulk({'class' => InlineWorker, 'args' => [true, true]})
+      assert Sidekiq::Client.push_bulk({'class' => InlineWorker, 'args' => [[true], [true]]})
 
       assert_raises InlineError do
-        Sidekiq::Client.push_bulk({'class' => InlineWorker, 'args' => [true, false]})
+        Sidekiq::Client.push_bulk({'class' => InlineWorker, 'args' => [[true], [false]]})
       end
     end
 

@@ -14,7 +14,9 @@ module Sidekiq
       # 3. after a few days, a developer deploys a fix.  the message is
       #    reprocessed successfully.
       # 4. if 3 never happens, sidekiq will eventually give up and throw the
-      #    message away.
+      #    message away. If the worker defines a method called 'retries_exhausted',
+      #    this will be called before throwing the message away. If the
+      #    'retries_exhausted' method throws an exception, it's dropped and logged.
       #
       # A message looks like:
       #
@@ -38,18 +40,32 @@ module Sidekiq
       #
       # We don't store the backtrace as that can add a lot of overhead
       # to the message and everyone is using Airbrake, right?
+      #
+      # The default number of retry attempts is 25. You can pass a value for the
+      # number of retry attempts when adding the middleware using the options hash:
+      #
+      #   Sidekiq.configure_server do |config|
+      #     config.server_middleware do |chain|
+      #       chain.add Middleware::Server::RetryJobs, :max_retries => 7
+      #     end
+      #   end
       class RetryJobs
         include Sidekiq::Util
 
-        # delayed_job uses the same basic formula
         DEFAULT_MAX_RETRY_ATTEMPTS = 25
-        DELAY = proc { |count| (count ** 4) + 15 + (rand(30)*(count+1)) }
+
+        def initialize(options = {})
+          @max_retries = options.fetch(:max_retries, DEFAULT_MAX_RETRY_ATTEMPTS)
+        end
 
         def call(worker, msg, queue)
           yield
+        rescue Sidekiq::Shutdown
+          # ignore, will be pushed back onto queue during hard_shutdown
+          raise
         rescue Exception => e
           raise e unless msg['retry']
-          max_retry_attempts = retry_attempts_from(msg['retry'], DEFAULT_MAX_RETRY_ATTEMPTS)
+          max_retry_attempts = retry_attempts_from(msg['retry'], @max_retries)
 
           msg['queue'] = if msg['retry_queue']
             msg['retry_queue']
@@ -68,12 +84,14 @@ module Sidekiq
 
           if msg['backtrace'] == true
             msg['error_backtrace'] = e.backtrace
+          elsif msg['backtrace'] == false
+            # do nothing
           elsif msg['backtrace'].to_i != 0
             msg['error_backtrace'] = e.backtrace[0..msg['backtrace'].to_i]
           end
 
           if count < max_retry_attempts
-            delay = DELAY.call(count)
+            delay = delay_for(worker, count)
             logger.debug { "Failure! Retry #{count} in #{delay} seconds" }
             retry_at = Time.now.to_f + delay
             payload = Sidekiq.dump_json(msg)
@@ -82,9 +100,25 @@ module Sidekiq
             end
           else
             # Goodbye dear message, you (re)tried your best I'm sure.
-            logger.debug { "Dropping message after hitting the retry maximum: #{msg}" }
+            retries_exhausted(worker, msg)
           end
+
           raise e
+        end
+
+        private
+
+        def retries_exhausted(worker, msg)
+          logger.debug { "Dropping message after hitting the retry maximum: #{msg}" }
+          if worker.respond_to?(:retries_exhausted)
+            logger.warn { "Defining #{worker.class.name}#retries_exhausted as a method is deprecated, use `sidekiq_retries_exhausted` callback instead http://git.io/Ijju8g" }
+            worker.retries_exhausted(*msg['args'])
+          elsif worker.sidekiq_retries_exhausted_block?
+            worker.sidekiq_retries_exhausted_block.call(msg)
+          end
+
+        rescue Exception => e
+          handle_exception(e, { :context => "Error calling retries_exhausted" })
         end
 
         def retry_attempts_from(msg_retry, default)
@@ -92,6 +126,24 @@ module Sidekiq
             msg_retry
           else
             default
+          end
+        end
+
+        def delay_for(worker, count)
+          worker.sidekiq_retry_in_block? && retry_in(worker, count) || seconds_to_delay(count)
+        end
+
+        # delayed_job uses the same basic formula
+        def seconds_to_delay(count)
+          (count ** 4) + 15 + (rand(30)*(count+1))
+        end
+
+        def retry_in(worker, count)
+          begin
+            worker.sidekiq_retry_in_block.call(count)
+          rescue Exception => e
+            handle_exception(e, { :context => "Failure scheduling retry using the defined `sidekiq_retry_in` in #{worker.class.name}, falling back to default" })
+            nil
           end
         end
 

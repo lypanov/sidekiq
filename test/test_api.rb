@@ -1,6 +1,6 @@
 require 'helper'
 
-class TestApi < MiniTest::Unit::TestCase
+class TestApi < Sidekiq::Test
   describe "stats" do
     before do
       Sidekiq.redis {|c| c.flushdb }
@@ -29,6 +29,18 @@ class TestApi < MiniTest::Unit::TestCase
         Sidekiq.redis { |conn| conn.set("stat:failed", 5) }
         s = Sidekiq::Stats.new
         assert_equal 5, s.failed
+      end
+    end
+
+    describe "reset" do
+      it 'can reset stats' do
+        Sidekiq.redis do |conn|
+          conn.set('stat:processed', 5)
+          conn.set('stat:failed', 10)
+          Sidekiq::Stats.new.reset
+          assert_equal '0', conn.get('stat:processed')
+          assert_equal '0', conn.get('stat:failed')
+        end
       end
     end
 
@@ -115,32 +127,6 @@ class TestApi < MiniTest::Unit::TestCase
           end
         end
       end
-
-      describe "cleanup" do
-        it 'removes processed stats outside of keep window' do
-          Sidekiq.redis do |c|
-            c.incrby("stat:processed:2012-05-03", 4)
-            c.incrby("stat:processed:2012-06-03", 4)
-            c.incrby("stat:processed:2012-07-03", 1)
-          end
-          Time.stub(:now, Time.parse("2012-12-01 1:00:00 -0500")) do
-            Sidekiq::Stats::History.cleanup
-            assert_equal false, Sidekiq.redis { |c| c.exists("stat:processed:2012-05-03") }
-          end
-        end
-
-        it 'removes failed stats outside of keep window' do
-          Sidekiq.redis do |c|
-            c.incrby("stat:failed:2012-05-03", 4)
-            c.incrby("stat:failed:2012-06-03", 4)
-            c.incrby("stat:failed:2012-07-03", 1)
-          end
-          Time.stub(:now, Time.parse("2012-12-01 1:00:00 -0500")) do
-            Sidekiq::Stats::History.cleanup
-            assert_equal false, Sidekiq.redis { |c| c.exists("stat:failed:2012-05-03") }
-          end
-        end
-      end
     end
   end
 
@@ -152,6 +138,7 @@ class TestApi < MiniTest::Unit::TestCase
     it 'shows queue as empty' do
       q = Sidekiq::Queue.new
       assert_equal 0, q.size
+      assert_equal 0, q.latency
     end
 
     class ApiWorker
@@ -160,12 +147,18 @@ class TestApi < MiniTest::Unit::TestCase
 
     it 'can enumerate jobs' do
       q = Sidekiq::Queue.new
-      ApiWorker.perform_async(1, 'mike')
-      assert_equal ['TestApi::ApiWorker'], q.map(&:klass)
+      Time.stub(:now, Time.new(2012, 12, 26)) do
+        ApiWorker.perform_async(1, 'mike')
+        assert_equal ['TestApi::ApiWorker'], q.map(&:klass)
 
-      job = q.first
-      assert_equal 24, job.jid.size
-      assert_equal [1, 'mike'], job.args
+        job = q.first
+        assert_equal 24, job.jid.size
+        assert_equal [1, 'mike'], job.args
+        assert_equal Time.new(2012, 12, 26), job.enqueued_at
+
+      end
+
+      assert q.latency > 10_000_000
 
       q = Sidekiq::Queue.new('other')
       assert_equal 0, q.size
@@ -177,6 +170,54 @@ class TestApi < MiniTest::Unit::TestCase
       assert_equal 1, q.size
       assert_equal [true], q.map(&:delete)
       assert_equal 0, q.size
+    end
+
+    it "can move scheduled job to queue" do
+      job_id = ApiWorker.perform_in(100, 1, 'jason')
+      job = Sidekiq::ScheduledSet.new.find_job(job_id)
+      q = Sidekiq::Queue.new
+      job.add_to_queue
+      queued_job = q.find_job(job_id)
+      refute_nil queued_job
+      assert_equal queued_job.jid, job_id
+      job = Sidekiq::ScheduledSet.new.find_job(job_id)
+      assert_nil job
+    end
+
+    it 'can find job by id in sorted sets' do
+      job_id = ApiWorker.perform_in(100, 1, 'jason')
+      job = Sidekiq::ScheduledSet.new.find_job(job_id)
+      refute_nil job
+      assert_equal job_id, job.jid
+      assert_in_delta job.latency, 0.0, 0.01
+    end
+
+    it 'can remove jobs when iterating over a sorted set' do
+      # scheduled jobs must be greater than SortedSet#each underlying page size
+      51.times do
+        ApiWorker.perform_in(100, 'aaron')
+      end
+      set = Sidekiq::ScheduledSet.new
+      set.map(&:delete)
+      assert_equal set.size, 0
+    end
+
+    it 'can remove jobs when iterating over a queue' do
+      # initial queue size must be greater than Queue#each underlying page size
+      51.times do
+        ApiWorker.perform_async(1, 'aaron')
+      end
+      q = Sidekiq::Queue.new
+      q.map(&:delete)
+      assert_equal q.size, 0
+    end
+
+    it 'can find job by id in queues' do
+      q = Sidekiq::Queue.new
+      job_id = ApiWorker.perform_async(1, 'jason')
+      job = q.find_job(job_id)
+      refute_nil job
+      assert_equal job_id, job.jid
     end
 
     it 'can clear a queue' do
@@ -272,23 +313,25 @@ class TestApi < MiniTest::Unit::TestCase
     it 'can enumerate workers' do
       w = Sidekiq::Workers.new
       assert_equal 0, w.size
-      w.each do |x, y|
+      w.each do
         assert false
       end
 
       s = '12345'
       data = Sidekiq.dump_json({ 'payload' => {}, 'queue' => 'default', 'run_at' => Time.now.to_i })
-      Sidekiq.redis do |c| 
+      Sidekiq.redis do |c|
         c.multi do
           c.sadd('workers', s)
           c.set("worker:#{s}", data)
+          c.set("worker:#{s}:started", Time.now.to_s)
         end
       end
 
       assert_equal 1, w.size
-      w.each do |x, y|
+      w.each do |x, y, z|
         assert_equal s, x
         assert_equal 'default', y['queue']
+        assert_equal Time.now.year, DateTime.parse(z).year
       end
     end
 

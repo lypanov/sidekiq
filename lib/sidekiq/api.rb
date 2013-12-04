@@ -3,17 +3,18 @@ require 'sidekiq'
 module Sidekiq
   class Stats
     def processed
-      count = Sidekiq.redis do |conn|
-                conn.get("stat:processed")
-              end
-      count.nil? ? 0 : count.to_i
+      Sidekiq.redis { |conn| conn.get("stat:processed") }.to_i
     end
 
     def failed
-      count = Sidekiq.redis do |conn|
-                conn.get("stat:failed")
-              end
-      count.nil? ? 0 : count.to_i
+      Sidekiq.redis { |conn| conn.get("stat:failed") }.to_i
+    end
+
+    def reset
+      Sidekiq.redis do |conn|
+        conn.set("stat:failed", 0)
+        conn.set("stat:processed", 0)
+      end
     end
 
     def queues
@@ -55,24 +56,6 @@ module Sidekiq
         date_stat_hash("failed")
       end
 
-      def self.cleanup
-        days_of_stats_to_keep = 180
-        today = Time.now.utc.to_date
-        delete_before_date = Time.now.utc.to_date - days_of_stats_to_keep
-
-        Sidekiq.redis do |conn|
-          processed_keys = conn.keys("stat:processed:*")
-          earliest = "stat:processed:#{delete_before_date.to_s}"
-          pkeys = processed_keys.select { |key| key < earliest }
-          conn.del(pkeys) if pkeys.size > 0
-
-          failed_keys = conn.keys("stat:failed:*")
-          earliest = "stat:failed:#{delete_before_date.to_s}"
-          fkeys = failed_keys.select { |key| key < earliest }
-          conn.del(fkeys) if fkeys.size > 0
-        end
-      end
-
       private
 
       def date_stat_hash(stat)
@@ -110,6 +93,10 @@ module Sidekiq
   class Queue
     include Enumerable
 
+    def self.all
+      Sidekiq.redis {|c| c.smembers('queues') }.map {|q| Sidekiq::Queue.new(q) }
+    end
+
     attr_reader :name
 
     def initialize(name="default")
@@ -121,26 +108,43 @@ module Sidekiq
       Sidekiq.redis { |con| con.llen(@rname) }
     end
 
+    def latency
+      entry = Sidekiq.redis do |conn|
+        conn.lrange(@rname, -1, -1)
+      end.first
+      return 0 unless entry
+      Time.now.to_f - Sidekiq.load_json(entry)['enqueued_at']
+    end
+
     def each(&block)
+      initial_size = size
+      deleted_size = 0
       page = 0
       page_size = 50
 
       loop do
+        range_start = page * page_size - deleted_size
+        range_end   = page * page_size - deleted_size + (page_size - 1)
         entries = Sidekiq.redis do |conn|
-          conn.lrange @rname, page * page_size, (page * page_size) + page_size - 1
+          conn.lrange @rname, range_start, range_end
         end
         break if entries.empty?
         page += 1
         entries.each do |entry|
           block.call Job.new(entry, @name)
         end
+        deleted_size = initial_size - size
       end
+    end
+
+    def find_job(jid)
+      self.detect { |j| j.jid == jid }
     end
 
     def clear
       Sidekiq.redis do |conn|
         conn.multi do
-          conn.del("queue:#{name}")
+          conn.del(@rname)
           conn.srem("queues", name)
         end
       end
@@ -175,15 +179,23 @@ module Sidekiq
       @item['jid']
     end
 
+    def enqueued_at
+      Time.at(@item['enqueued_at'] || 0).utc
+    end
+
     def queue
       @queue
+    end
+
+    def latency
+      Time.now.to_f - @item['enqueued_at']
     end
 
     ##
     # Remove this job from the queue.
     def delete
       count = Sidekiq.redis do |conn|
-        conn.lrem("queue:#{@queue}", 0, @value)
+        conn.lrem("queue:#{@queue}", 1, @value)
       end
       count != 0
     end
@@ -203,7 +215,7 @@ module Sidekiq
     end
 
     def at
-      Time.at(score)
+      Time.at(score).utc
     end
 
     def delete
@@ -215,6 +227,17 @@ module Sidekiq
       @parent.schedule(at, item)
     end
 
+    def add_to_queue
+      Sidekiq.redis do |conn|
+        results = conn.zrangebyscore('schedule', score, score)
+        conn.zremrangebyscore('schedule', score, score)
+        results.map do |message|
+          msg = Sidekiq.load_json(message)
+          Sidekiq::Client.push(msg)
+        end
+      end
+    end
+
     def retry
       raise "Retry not available on jobs not in the Retry queue." unless item["failed_at"]
       Sidekiq.redis do |conn|
@@ -223,7 +246,7 @@ module Sidekiq
         results.map do |message|
           msg = Sidekiq.load_json(message)
           msg['retry_count'] = msg['retry_count'] - 1
-          conn.rpush("queue:#{msg['queue']}", Sidekiq.dump_json(msg))
+          Sidekiq::Client.push(msg)
         end
       end
     end
@@ -234,6 +257,7 @@ module Sidekiq
 
     def initialize(name)
       @zset = name
+      @_size = size
     end
 
     def size
@@ -242,24 +266,28 @@ module Sidekiq
 
     def schedule(timestamp, message)
       Sidekiq.redis do |conn|
-        conn.zadd(@zset, timestamp.to_s, Sidekiq.dump_json(message))
+        conn.zadd(@zset, timestamp.to_f.to_s, Sidekiq.dump_json(message))
       end
     end
 
     def each(&block)
-      # page thru the sorted set backwards so deleting entries doesn't screw up indexing
+      initial_size = @_size
+      offset_size = 0
       page = -1
       page_size = 50
 
       loop do
+        range_start = page * page_size + offset_size
+        range_end   = page * page_size + offset_size + (page_size - 1)
         elements = Sidekiq.redis do |conn|
-          conn.zrange @zset, page * page_size, (page * page_size) + (page_size - 1), :with_scores => true
+          conn.zrange @zset, range_start, range_end, :with_scores => true
         end
         break if elements.empty?
         page -= 1
         elements.each do |element, score|
           block.call SortedEntry.new(self, score, element)
         end
+        offset_size = initial_size - @_size
       end
     end
 
@@ -279,6 +307,10 @@ module Sidekiq
       end
     end
 
+    def find_job(jid)
+      self.detect { |j| j.jid == jid }
+    end
+
     def delete(score, jid = nil)
       if jid
         elements = Sidekiq.redis do |conn|
@@ -289,13 +321,21 @@ module Sidekiq
           message = Sidekiq.load_json(element)
 
           if message["jid"] == jid
-            Sidekiq.redis { |conn| conn.zrem(@zset, element) }
+            _, @_size = Sidekiq.redis do |conn|
+              conn.multi do
+                conn.zrem(@zset, element)
+                conn.zcard @zset
+              end
+            end
           end
         end
         elements_with_jid.count != 0
       else
-        count = Sidekiq.redis do |conn|
-          conn.zremrangebyscore(@zset, score, score)
+        count, @_size = Sidekiq.redis do |conn|
+          conn.multi do
+            conn.zremrangebyscore(@zset, score, score)
+            conn.zcard @zset
+          end
         end
         count != 0
       end
@@ -342,6 +382,12 @@ module Sidekiq
     def initialize
       super 'retry'
     end
+
+    def retry_all
+      while size > 0
+        each(&:retry)
+      end
+    end
   end
 
 
@@ -351,15 +397,16 @@ module Sidekiq
   # WARNING WARNING WARNING
   #
   # This is live data that can change every millisecond.
-  # If you do #size => 5 and then expect #each to be
+  # If you call #size => 5 and then expect #each to be
   # called 5 times, you're going to have a bad time.
   #
   #    workers = Sidekiq::Workers.new
   #    workers.size => 2
-  #    workers.each do |name, work|
-  #      # name is a unique identifier per Processor instance
+  #    workers.each do |name, work, started_at|
+  #      # name is a unique identifier per worker
   #      # work is a Hash which looks like:
   #      # { 'queue' => name, 'run_at' => timestamp, 'payload' => msg }
+  #      # started_at is a String rep of the time when the worker started working on the job
   #    end
 
   class Workers
@@ -369,9 +416,12 @@ module Sidekiq
       Sidekiq.redis do |conn|
         workers = conn.smembers("workers")
         workers.each do |w|
-          msg = conn.get("worker:#{w}")
+          msg, time = conn.multi do
+            conn.get("worker:#{w}")
+            conn.get("worker:#{w}:started")
+          end
           next unless msg
-          block.call(w, Sidekiq.load_json(msg))
+          block.call(w, Sidekiq.load_json(msg), time)
         end
       end
     end

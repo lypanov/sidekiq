@@ -1,45 +1,3 @@
-trap 'INT' do
-  if Sidekiq.options[:profile]
-    result = RubyProf.stop
-    printer = RubyProf::GraphHtmlPrinter.new(result)
-    File.open("profile.html", 'w') do |f|
-      printer.print(f, :min_percent => 1)
-    end
-  end
-  # Handle Ctrl-C in JRuby like MRI
-  # http://jira.codehaus.org/browse/JRUBY-4637
-  Sidekiq::CLI.instance.interrupt
-end
-
-trap 'TERM' do
-  # Heroku sends TERM and then waits 10 seconds for process to exit.
-  Sidekiq::CLI.instance.interrupt
-end
-
-trap 'USR1' do
-  Sidekiq.logger.info "Received USR1, no longer accepting new work"
-  mgr = Sidekiq::CLI.instance.manager
-  mgr.async.stop if mgr
-end
-
-trap 'USR2' do
-  if Sidekiq.options[:logfile]
-    Sidekiq.logger.info "Received USR2, reopening log file"
-    Sidekiq::Logging.initialize_logger(Sidekiq.options[:logfile])
-  end
-end
-
-trap 'TTIN' do
-  Thread.list.each do |thread|
-    Sidekiq.logger.info "Thread TID-#{thread.object_id.to_s(36)} #{thread['label']}"
-    if thread.backtrace
-      Sidekiq.logger.info thread.backtrace.join("\n")
-    else
-      Sidekiq.logger.info "<no backtrace available>"
-    end
-  end
-end
-
 $stdout.sync = true
 
 require 'yaml'
@@ -51,19 +9,25 @@ require 'sidekiq'
 require 'sidekiq/util'
 
 module Sidekiq
+  # We are shutting down Sidekiq but what about workers that
+  # are working on some long job?  This error is
+  # raised in workers that have not finished within the hard
+  # timeout limit.  This is needed to rollback db transactions,
+  # otherwise Ruby's Thread#kill will commit.  See #377.
+  # DO NOT RESCUE THIS ERROR.
+  class Shutdown < Interrupt; end
+
   class CLI
     include Util
     include Singleton
 
     # Used for CLI testing
     attr_accessor :code
-    attr_accessor :manager
+    attr_accessor :launcher
     attr_accessor :environment
 
     def initialize
       @code = nil
-      @interrupt_mutex = Mutex.new
-      @interrupted = false
     end
 
     def parse(args=ARGV)
@@ -79,53 +43,92 @@ module Sidekiq
     end
 
     def run
-      logger.info "Booting Sidekiq #{Sidekiq::VERSION} with Redis at #{redis {|x| x.client.id}}"
+      self_read, self_write = IO.pipe
+
+      %w(INT TERM USR1 USR2 TTIN).each do |sig|
+        trap sig do
+          self_write.puts(sig)
+        end
+      end
+
+      redis {} # noop to connect redis and print info
       logger.info "Running in #{RUBY_DESCRIPTION}"
       logger.info Sidekiq::LICENSE
-
-      Sidekiq::Stats::History.cleanup
 
       if !options[:daemon]
         logger.info 'Starting processing, hit Ctrl-C to stop'
       end
 
-      @manager = Sidekiq::Manager.new(options)
-      poller = Sidekiq::Scheduled::Poller.new
+      require 'sidekiq/launcher'
+      @launcher = Sidekiq::Launcher.new(options)
+      launcher.procline(options[:tag] ? "#{options[:tag]} " : '')
+
       begin
         if options[:profile]
           require 'ruby-prof'
           RubyProf.start
         end
-        @manager.async.start
-        poller.async.poll(true)
-        sleep
+        launcher.run
+
+        while readable_io = IO.select([self_read])
+          signal = readable_io.first[0].gets.strip
+          handle_signal(signal)
+        end
       rescue Interrupt
         logger.info 'Shutting down'
-        poller.async.terminate if poller.alive?
-        @manager.async.stop(:shutdown => true, :timeout => options[:timeout])
-        @manager.wait(:shutdown)
+        launcher.stop
         # Explicitly exit so busy Processor threads can't block
         # process shutdown.
         exit(0)
       end
     end
 
-    def interrupt
-      @interrupt_mutex.synchronize do
-        unless @interrupted
-          @interrupted = true
-          Thread.main.raise Interrupt
+    private
+
+    def handle_signal(sig)
+      Sidekiq.logger.debug "Got #{sig} signal"
+      case sig
+      when 'INT'
+        if Sidekiq.options[:profile]
+          result = RubyProf.stop
+          printer = RubyProf::GraphHtmlPrinter.new(result)
+          File.open("profile.html", 'w') do |f|
+            printer.print(f, :min_percent => 1)
+          end
+        end
+        # Handle Ctrl-C in JRuby like MRI
+        # http://jira.codehaus.org/browse/JRUBY-4637
+        raise Interrupt
+      when 'TERM'
+        # Heroku sends TERM and then waits 10 seconds for process to exit.
+        raise Interrupt
+      when 'USR1'
+        Sidekiq.logger.info "Received USR1, no longer accepting new work"
+        launcher.manager.async.stop
+      when 'USR2'
+        if Sidekiq.options[:logfile]
+          Sidekiq.logger.info "Received USR2, reopening log file"
+          initialize_logger
+        end
+      when 'TTIN'
+        Thread.list.each do |thread|
+          Sidekiq.logger.info "Thread TID-#{thread.object_id.to_s(36)} #{thread['label']}"
+          if thread.backtrace
+            Sidekiq.logger.info thread.backtrace.join("\n")
+          else
+            Sidekiq.logger.info "<no backtrace available>"
+          end
         end
       end
     end
 
-    private
-
     def load_celluloid
+      raise "Celluloid cannot be required until here, or it will break Sidekiq's daemonization" if defined?(::Celluloid) && options[:daemon]
+
       # Celluloid can't be loaded until after we've daemonized
       # because it spins up threads and creates locks which get
       # into a very bad state if forked.
-      require 'celluloid'
+      require 'celluloid/autostart'
       Celluloid.logger = (options[:verbose] ? Sidekiq.logger : nil)
 
       require 'sidekiq/manager'
@@ -217,7 +220,7 @@ module Sidekiq
       if !File.exist?(options[:require]) ||
          (File.directory?(options[:require]) && !File.exist?("#{options[:require]}/config/application.rb"))
         logger.info "=================================================================="
-        logger.info "  Please point sidekiq to a Rails 3 application or a Ruby file    "
+        logger.info "  Please point sidekiq to a Rails 3/4 application or a Ruby file  "
         logger.info "  to load your worker classes with -r [DIR|FILE]."
         logger.info "=================================================================="
         logger.info @parser
@@ -246,7 +249,7 @@ module Sidekiq
         end
 
         o.on '-i', '--index INT', "unique process index on this machine" do |arg|
-          opts[:index] = Integer(arg)
+          opts[:index] = Integer(arg.match(/\d+/)[0])
         end
 
         o.on '-p', '--profile', "Profile all code run by Sidekiq" do |arg|
@@ -316,9 +319,16 @@ module Sidekiq
       if File.exist?(cfile)
         opts = YAML.load(ERB.new(IO.read(cfile)).result)
         opts = opts.merge(opts.delete(environment) || {})
-        parse_queues opts, opts.delete(:queues) || []
+        parse_queues(opts, opts.delete(:queues) || [])
       else
-        raise ArgumentError, "can't find config file #{cfile}"
+        # allow a non-existent config file so Sidekiq
+        # can be deployed by cap with just the defaults.
+      end
+      ns = opts.delete(:namespace)
+      if ns
+        # logger hasn't been initialized yet, puts is all we have.
+        puts("namespace should be set in your ruby initializer, is ignored in config file")
+        puts("config.redis = { :url => ..., :namespace => '#{ns}' }")
       end
       opts
     end

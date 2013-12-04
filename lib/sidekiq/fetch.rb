@@ -1,5 +1,5 @@
 require 'sidekiq'
-require 'celluloid'
+require 'sidekiq/actor'
 
 module Sidekiq
   ##
@@ -7,15 +7,15 @@ module Sidekiq
   # from the queues.  It gets the message and hands it to the Manager
   # to assign to a ready Processor.
   class Fetcher
-    include Celluloid
-    include Sidekiq::Util
+    include Util
+    include Actor
 
     TIMEOUT = 1
 
     def initialize(mgr, options)
-      klass = Sidekiq.options[:fetch] || BasicFetch
+      @down = nil
       @mgr = mgr
-      @strategy = klass.new(options)
+      @strategy = Fetcher.strategy.new(options)
     end
 
     # Fetching is straightforward: the Manager makes a fetch
@@ -32,6 +32,8 @@ module Sidekiq
 
         begin
           work = @strategy.retrieve_work
+          ::Sidekiq.logger.info("Redis is online, #{Time.now.to_f - @down.to_f} sec downtime") if @down
+          @down = nil
 
           if work
             @mgr.async.assign(work)
@@ -39,12 +41,25 @@ module Sidekiq
             after(0) { fetch }
           end
         rescue => ex
-          logger.error("Error fetching message: #{ex}")
-          logger.error(ex.backtrace.first)
-          sleep(TIMEOUT)
-          after(0) { fetch }
+          handle_fetch_exception(ex)
+        end
+
+      end
+    end
+
+    def handle_fetch_exception(ex)
+      if !@down
+        logger.error("Error fetching message: #{ex}")
+        ex.backtrace.each do |bt|
+          logger.error(bt)
         end
       end
+      @down ||= Time.now
+      sleep(TIMEOUT)
+      after(0) { fetch }
+    rescue Task::TerminatedError
+      # If redis is down when we try to shut down, all the fetch backlog
+      # raises these errors.  Haven't been able to figure out what I'm doing wrong.
     end
 
     # Ugh.  Say hello to a bloody hack.
@@ -56,6 +71,10 @@ module Sidekiq
 
     def self.done?
       @done
+    end
+
+    def self.strategy
+      Sidekiq.options[:fetch] || BasicFetch
     end
   end
 
@@ -71,20 +90,24 @@ module Sidekiq
       UnitOfWork.new(*work) if work
     end
 
-    def self.bulk_requeue(inprogress)
+    # By leaving this as a class method, it can be pluggable and used by the Manager actor. Making it
+    # an instance method will make it async to the Fetcher actor
+    def self.bulk_requeue(inprogress, options)
       Sidekiq.logger.debug { "Re-queueing terminated jobs" }
       jobs_to_requeue = {}
       inprogress.each do |unit_of_work|
-        jobs_to_requeue[unit_of_work.queue] ||= []
-        jobs_to_requeue[unit_of_work.queue] << unit_of_work.message
+        jobs_to_requeue[unit_of_work.queue_name] ||= []
+        jobs_to_requeue[unit_of_work.queue_name] << unit_of_work.message
       end
 
       Sidekiq.redis do |conn|
         jobs_to_requeue.each do |queue, jobs|
-          conn.rpush(queue, jobs)
+          conn.rpush("queue:#{queue}", jobs)
         end
       end
       Sidekiq.logger.info("Pushed #{inprogress.size} messages back to Redis")
+    rescue => ex
+      Sidekiq.logger.warn("Failed to requeue #{inprogress.size} jobs: #{ex.message}")
     end
 
     UnitOfWork = Struct.new(:queue, :message) do
@@ -98,7 +121,7 @@ module Sidekiq
 
       def requeue
         Sidekiq.redis do |conn|
-          conn.rpush(queue, message)
+          conn.rpush("queue:#{queue_name}", message)
         end
       end
     end

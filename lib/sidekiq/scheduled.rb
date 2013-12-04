@@ -1,6 +1,6 @@
 require 'sidekiq'
 require 'sidekiq/util'
-require 'celluloid'
+require 'sidekiq/actor'
 
 module Sidekiq
   module Scheduled
@@ -13,8 +13,8 @@ module Sidekiq
     # just pops the message back onto its original queue so the
     # workers can pick it up like any other message.
     class Poller
-      include Celluloid
-      include Sidekiq::Util
+      include Util
+      include Actor
 
       SETS = %w(retry schedule)
 
@@ -28,25 +28,27 @@ module Sidekiq
             now = Time.now.to_f.to_s
             Sidekiq.redis do |conn|
               SETS.each do |sorted_set|
-                (messages, _) = conn.multi do
-                  conn.zrangebyscore(sorted_set, '-inf', now)
-                  conn.zremrangebyscore(sorted_set, '-inf', now)
-                end
+                # Get the next item in the queue if it's score (time to execute) is <= now.
+                # We need to go through the list one at a time to reduce the risk of something
+                # going wrong between the time jobs are popped from the scheduled queue and when
+                # they are pushed onto a work queue and losing the jobs.
+                while message = conn.zrangebyscore(sorted_set, '-inf', now, :limit => [0, 1]).first do
 
-                messages.each do |message|
-                  logger.debug { "enqueued #{sorted_set}: #{message}" }
-                  msg = Sidekiq.load_json(message)
-                  conn.multi do
-                    conn.sadd('queues', msg['queue'])
-                    conn.rpush("queue:#{msg['queue']}", message)
+                  # Pop item off the queue and add it to the work queue. If the job can't be popped from
+                  # the queue, it's because another process already popped it so we can move on to the
+                  # next one.
+                  if conn.zrem(sorted_set, message)
+                    Sidekiq::Client.push(Sidekiq.load_json(message))
+                    logger.debug { "enqueued #{sorted_set}: #{message}" }
                   end
                 end
               end
             end
-          rescue SystemCallError, Redis::TimeoutError, Redis::ConnectionError => ex
-            # ECONNREFUSED, etc.  Most likely a problem with
-            # redis networking.  Punt and try again at the next interval
-            logger.warn ex.message
+          rescue => ex
+            # Most likely a problem with redis networking.
+            # Punt and try again at the next interval
+            logger.error ex.message
+            logger.error ex.backtrace.first
           end
 
           after(poll_interval) { poll }

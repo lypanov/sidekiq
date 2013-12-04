@@ -3,7 +3,7 @@ require 'sidekiq/extensions/generic_proxy'
 module Sidekiq
   module Extensions
     ##
-    # Adds 'delay' and 'delay_for' to ActionMailer to offload arbitrary email
+    # Adds 'delay', 'delay_for' and `delay_until` methods to ActionMailer to offload arbitrary email
     # delivery to Sidekiq.  Example:
     #
     #    UserMailer.delay.send_welcome_email(new_user)
@@ -11,9 +11,6 @@ module Sidekiq
     #    UserMailer.delay_until(5.days.from_now).send_welcome_email(new_user)
     class DelayedMailer
       include Sidekiq::Worker
-      # I think it's reasonable to assume that emails should take less
-      # than 30 seconds to send.
-      sidekiq_options :timeout => 30
 
       def perform(yml)
         (target, method_name, args) = YAML.load(yml)
